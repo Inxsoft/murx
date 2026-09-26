@@ -1,19 +1,37 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "murx"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reference implementation of the MURX (Multi-User Resource eXchange) authenticated routing gateway protocol"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Thomas Kuiper" }]
+keywords = ["protocol", "authentication", "gateway", "routing", "redirect", "asyncio"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Internet",
+    "Topic :: Security",
+    "Topic :: System :: Networking",
+]
+
+[project.urls]
+Homepage = "https://murx.ai/"
+Specification = "https://github.com/Inxsoft/murx/blob/main/spec/SPEC.md"
+Source = "https://github.com/Inxsoft/murx"
+Issues = "https://github.com/Inxsoft/murx/issues"
 
 [project.optional-dependencies]
 srv = ["dnspython>=2.0"]
-dev = ["pytest>=7.0", "pytest-asyncio>=0.23"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.23", "hypothesis>=6.0"]
 
 [tool.setuptools.packages.find]
 include = ["murx*"]

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 import struct
 from dataclasses import dataclass
+from typing import Optional
 
 from .errors import AuthenticationError
 from .packets import (
@@ -24,7 +26,7 @@ DEFAULT_PORT = 2743
 class RouteInfo:
     """What a client needs to open its actual backend session."""
 
-    target_ip: str
+    target_host: str
     target_port: int
     token: bytes
 
@@ -38,8 +40,9 @@ class MurxClient:
             host="murx.example.com",
             client_id="alice@example.com",
             auth_data=b"hunter2",
+            ssl_context=murx.tls.client_context(),
         )
-        # route.target_ip, route.target_port, route.token
+        # route.target_host, route.target_port, route.token
     """
 
     @staticmethod
@@ -49,8 +52,14 @@ class MurxClient:
         auth_data: bytes,
         port: int = DEFAULT_PORT,
         timeout: float = 10.0,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ) -> RouteInfo:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                host, port, ssl=ssl_context, server_hostname=host if ssl_context else None
+            ),
+            timeout,
+        )
         try:
             request = AuthConnect(client_id=client_id, auth_data=auth_data)
             await _write_tcp_message(writer, request.encode())
@@ -66,7 +75,7 @@ class MurxClient:
         if opcode == Opcode.ROUTE_REDIRECT:
             redirect = RouteRedirect.decode(payload)
             return RouteInfo(
-                target_ip=redirect.target_ip,
+                target_host=redirect.target_host,
                 target_port=redirect.target_port,
                 token=redirect.token,
             )
@@ -77,7 +86,9 @@ class MurxClient:
 
     @staticmethod
     async def connect_to_backend(
-        route: RouteInfo, timeout: float = 10.0
+        route: RouteInfo,
+        timeout: float = 10.0,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """Open the post-redirect session and present the token.
 
@@ -89,7 +100,13 @@ class MurxClient:
         replace with their own backend-facing handshake.
         """
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(route.target_ip, route.target_port), timeout
+            asyncio.open_connection(
+                route.target_host,
+                route.target_port,
+                ssl=ssl_context,
+                server_hostname=route.target_host if ssl_context else None,
+            ),
+            timeout,
         )
         writer.write(struct.pack("!B", len(route.token)) + route.token)
         await writer.drain()

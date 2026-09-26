@@ -2,9 +2,9 @@
 """End-to-end MURX demo, no external services required.
 
 Spins up, on loopback:
-  - one MurxServer (TCP auth/redirect + UDP node registry)
-  - two toy "ERP" backend nodes, each announcing/heartbeating itself
-    over UDP via BackendAnnouncer
+  - one MurxServer (TCP auth/redirect + authenticated UDP node registry)
+  - two toy "ERP" backend nodes, each announcing itself over UDP with
+    its own shared secret and verifying signed tokens locally
   - one MurxClient authenticating as alice@example.com and following
     the redirect to whichever node MURX picked
 
@@ -14,83 +14,75 @@ Run with: python examples/erp_backend_demo.py
 from __future__ import annotations
 
 import asyncio
+import secrets
 
 from murx import (
+    BackendAnnouncer,
     MurxClient,
     MurxServer,
     NodeRegistry,
     NodeRegistryRouter,
+    SignedTokenIssuer,
+    SignedTokenVerifier,
     StaticAuthBackend,
     TokenGatedServer,
-    TokenStore,
 )
-from murx.node_registry import BackendAnnouncer
 
 CREDENTIALS = {"alice@example.com": "hunter2"}
+NODES = {"erp-1": 100, "erp-2": 50}  # node_id -> capacity
 
 
-def make_erp_session_handler(node_name: str):
+def make_session_handler(node_id: str):
     async def handle_session(client_id, reader, writer):
-        writer.write(f"ERP[{node_name}]: welcome, {client_id}\n".encode())
+        writer.write(f"ERP[{node_id}]: welcome, {client_id}\n".encode())
         await writer.drain()
 
     return handle_session
 
 
-async def start_backend_node(node_name: str, token_store: TokenStore) -> TokenGatedServer:
-    server = TokenGatedServer(
-        token_store=token_store,
-        session_handler=make_erp_session_handler(node_name),
-        host="127.0.0.1",
-        port=0,
-    )
-    await server.start()
-    return server
-
-
 async def main() -> None:
-    token_store = TokenStore()
-    registry = NodeRegistry()
+    # One shared secret per node, known to that node and the MURX server.
+    node_secrets = {node_id: secrets.token_bytes(32) for node_id in NODES}
 
+    registry = NodeRegistry(node_secrets=node_secrets)
     murx_server = MurxServer(
         auth_backend=StaticAuthBackend(CREDENTIALS),
         router=NodeRegistryRouter(registry),
         host="127.0.0.1",
         port=0,
         node_registry=registry,
-        token_store=token_store,
+        token_issuer=SignedTokenIssuer(node_secrets),
     )
     await murx_server.start()
     murx_host, murx_port = murx_server.address
     print(f"MURX server listening on {murx_host}:{murx_port} (tcp+udp)")
 
-    node_a = await start_backend_node("erp-1", token_store)
-    node_b = await start_backend_node("erp-2", token_store)
+    backends = {}
+    for node_id in NODES:
+        backend = TokenGatedServer(
+            SignedTokenVerifier(node_id, node_secrets[node_id]),
+            make_session_handler(node_id),
+            host="127.0.0.1",
+            port=0,
+        )
+        await backend.start()
+        backends[node_id] = backend
 
-    stop_events = [asyncio.Event(), asyncio.Event()]
+    stop = asyncio.Event()
     announcers = [
         BackendAnnouncer(
-            node_id="erp-1",
-            node_ip="127.0.0.1",
-            node_port=node_a.address[1],
-            capacity=100,
+            node_id=node_id,
+            node_host="127.0.0.1",
+            node_port=backends[node_id].address[1],
+            capacity=capacity,
             server_host=murx_host,
             server_port=murx_port,
+            secret=node_secrets[node_id],
             heartbeat_interval=1.0,
-        ),
-        BackendAnnouncer(
-            node_id="erp-2",
-            node_ip="127.0.0.1",
-            node_port=node_b.address[1],
-            capacity=50,
-            server_host=murx_host,
-            server_port=murx_port,
-            heartbeat_interval=1.0,
-        ),
+        )
+        for node_id, capacity in NODES.items()
     ]
-    announcer_tasks = [
-        asyncio.create_task(a.run(stop_event=e)) for a, e in zip(announcers, stop_events)
-    ]
+    tasks = [asyncio.create_task(a.run(stop_event=stop)) for a in announcers]
 
     # Give the UDP NODE_ANNOUNCE datagrams a moment to land in the registry.
     await asyncio.sleep(0.3)
@@ -102,7 +94,7 @@ async def main() -> None:
             client_id="alice@example.com",
             auth_data=b"hunter2",
         )
-        print(f"Routed to {route.target_ip}:{route.target_port} with token {route.token.hex()}")
+        print(f"Routed to {route.target_host}:{route.target_port} ({len(route.token)}-byte signed token)")
 
         reader, writer = await MurxClient.connect_to_backend(route)
         greeting = await reader.readline()
@@ -110,12 +102,10 @@ async def main() -> None:
         writer.close()
         await writer.wait_closed()
     finally:
-        for e in stop_events:
-            e.set()
-        for t in announcer_tasks:
-            await t
-        await node_a.stop()
-        await node_b.stop()
+        stop.set()
+        await asyncio.gather(*tasks)
+        for backend in backends.values():
+            await backend.stop()
         await murx_server.stop()
 
 

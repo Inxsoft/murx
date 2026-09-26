@@ -39,7 +39,7 @@ async def run(client_id: str, password: str, murx_host: str | None, murx_port: i
         print(f"Authentication failed: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Routed to {route.target_ip}:{route.target_port}")
+    print(f"Routed to {route.target_host}:{route.target_port}")
 
     reader, writer = await MurxClient.connect_to_backend(route)
     try:

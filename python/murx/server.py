@@ -1,23 +1,25 @@
 """MURX server: the TCP-facing authenticated routing gateway.
 
-See docs/SPEC.md sections 4-8. This module implements the AUTH_CONNECT ->
+See spec/SPEC.md sections 4-8. This module implements the AUTH_CONNECT ->
 ROUTE_REDIRECT/AUTH_REJECT exchange and wires it up to a pluggable
-AuthBackend and a Router (by default, backed by a NodeRegistry fed over
-UDP -- see node_registry.py).
+AuthBackend, a Router (by default backed by a NodeRegistry fed over
+authenticated UDP), and a token issuer (by default SignedTokenIssuer).
 """
 
 from __future__ import annotations
 
 import asyncio
 import secrets
+import ssl
 import struct
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Protocol
 
 from .errors import NoRouteError
 from .node_registry import NodeRegistry, serve_node_registry
 from .packets import (
+    SUPPORTED_VERSIONS,
     AuthConnect,
     AuthReject,
     MurxProtocolError,
@@ -31,7 +33,9 @@ __all__ = [
     "AuthBackend",
     "StaticAuthBackend",
     "Router",
+    "RouteTarget",
     "NodeRegistryRouter",
+    "TokenIssuer",
     "TokenStore",
     "MurxServer",
 ]
@@ -67,12 +71,24 @@ class StaticAuthBackend(AuthBackend):
         return secrets.compare_digest(auth_data, expected.encode("utf-8"))
 
 
+@dataclass(frozen=True)
+class RouteTarget:
+    host: str
+    port: int
+    node_id: str
+
+
 class Router(Protocol):
-    async def route(self, client_id: str) -> tuple[str, int]:
-        """Return (ip, port) of the backend node to send client_id to.
+    async def route(self, client_id: str) -> RouteTarget:
+        """Return the backend node to send client_id to.
 
         Raise NoRouteError if no backend is available.
         """
+
+
+class TokenIssuer(Protocol):
+    def issue(self, client_id: str, node_id: Optional[str] = None) -> bytes:
+        """Mint a one-time token for client_id, redeemable at node_id."""
 
 
 class NodeRegistryRouter:
@@ -81,9 +97,9 @@ class NodeRegistryRouter:
     def __init__(self, registry: NodeRegistry):
         self.registry = registry
 
-    async def route(self, client_id: str) -> tuple[str, int]:
+    async def route(self, client_id: str) -> RouteTarget:
         entry = self.registry.choose_node()
-        return entry.ip, entry.port
+        return RouteTarget(host=entry.host, port=entry.port, node_id=entry.node_id)
 
 
 @dataclass
@@ -93,12 +109,11 @@ class _TokenRecord:
 
 
 class TokenStore:
-    """Shared token store between the MURX server and backend nodes.
+    """Legacy opaque-token store shared between the MURX server and backends.
 
-    In a real deployment this would be a distributed cache (Redis, etc.)
-    reachable by both the MURX server and every backend node. For the
-    reference implementation and tests, a single in-memory instance is
-    passed to both sides directly.
+    Prefer SignedTokenIssuer/SignedTokenVerifier (murx.tokens), which need
+    no shared state. This remains for single-process setups and
+    deployments that already run a shared cache.
     """
 
     def __init__(self, ttl: float = DEFAULT_TOKEN_TTL, loop_time=None):
@@ -111,7 +126,7 @@ class TokenStore:
             return self._loop_time()
         return asyncio.get_running_loop().time()
 
-    def issue(self, client_id: str) -> bytes:
+    def issue(self, client_id: str, node_id: Optional[str] = None) -> bytes:
         token = secrets.token_bytes(16)
         self._tokens[token] = _TokenRecord(client_id=client_id, expires_at=self._now() + self.ttl)
         return token
@@ -134,14 +149,16 @@ class MurxServer:
         host: str = "0.0.0.0",
         port: int = 2743,
         node_registry: Optional[NodeRegistry] = None,
-        token_store: Optional[TokenStore] = None,
+        token_issuer: Optional[TokenIssuer] = None,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ):
         self.auth_backend = auth_backend
         self.router = router
         self.host = host
         self.port = port
         self.node_registry = node_registry
-        self.token_store = token_store if token_store is not None else TokenStore()
+        self.token_issuer = token_issuer if token_issuer is not None else TokenStore()
+        self.ssl_context = ssl_context
         self._tcp_server: Optional[asyncio.base_events.Server] = None
         self._udp_transport = None
 
@@ -152,7 +169,9 @@ class MurxServer:
         return sock.getsockname()[:2]
 
     async def start(self) -> None:
-        self._tcp_server = await asyncio.start_server(self._handle_client, self.host, self.port)
+        self._tcp_server = await asyncio.start_server(
+            self._handle_client, self.host, self.port, ssl=self.ssl_context
+        )
         # TCP and UDP have independent port namespaces, so binding both
         # sockets to the same port number is always possible even when
         # self.port == 0 (OS-assigned): resolve the actual TCP port first so
@@ -191,6 +210,8 @@ class MurxServer:
                 await _write_tcp_message(writer, reply)
             except (ConnectionError, OSError):
                 pass
+        except (asyncio.IncompleteReadError, ConnectionError, OSError, ssl.SSLError):
+            pass
         finally:
             writer.close()
             try:
@@ -199,6 +220,11 @@ class MurxServer:
                 pass
 
     async def _process(self, payload: bytes) -> bytes:
+        if payload and payload[0] not in SUPPORTED_VERSIONS:
+            return AuthReject(
+                reason_code=ReasonCode.UNSUPPORTED_VERSION,
+                reason_text=",".join(str(v) for v in SUPPORTED_VERSIONS),
+            ).encode()
         opcode = peek_opcode(payload)
         if opcode != Opcode.AUTH_CONNECT:
             return AuthReject(
@@ -212,12 +238,12 @@ class MurxServer:
             return AuthReject(reason_code=ReasonCode.INVALID_CREDENTIALS).encode()
 
         try:
-            ip, port = await self.router.route(request.client_id)
+            target = await self.router.route(request.client_id)
+            token = self.token_issuer.issue(request.client_id, target.node_id)
         except NoRouteError as exc:
             return AuthReject(reason_code=ReasonCode.NO_ROUTE, reason_text=str(exc)).encode()
 
-        token = self.token_store.issue(request.client_id)
-        return RouteRedirect(target_ip=ip, target_port=port, token=token).encode()
+        return RouteRedirect(target_host=target.host, target_port=target.port, token=token).encode()
 
 
 async def _read_tcp_message(reader: asyncio.StreamReader) -> Optional[bytes]:

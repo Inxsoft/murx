@@ -1,39 +1,49 @@
 """Backend-node-side helper for redeeming MURX tokens.
 
 Presenting a token to a backend node is deliberately outside the MURX
-wire protocol (docs/SPEC.md section 2: backend nodes are not MURX
+wire protocol (spec/SPEC.md section 2: backend nodes are not MURX
 peers). ``TokenGatedServer`` implements the same minimal reference
 convention as ``MurxClient.connect_to_backend`` -- a 1-byte token length
-prefix followed by the raw token -- so the sample ERP backend and the
-test suite have something concrete to run against. Real deployments are
-free to use any backend-facing handshake they like, as long as the token
-is redeemed exactly once.
+prefix followed by the raw token -- so the sample backends and the test
+suite have something concrete to run against. Real deployments are free
+to use any backend-facing handshake they like, as long as the token is
+redeemed exactly once.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Awaitable, Callable, Optional
-
-from .server import TokenStore
+import ssl
+from typing import Awaitable, Callable, Optional, Protocol
 
 SessionHandler = Callable[[str, asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
 
 
+class TokenVerifier(Protocol):
+    def redeem(self, token: bytes) -> Optional[str]:
+        """Return the client_id for a valid, unused token, else None."""
+
+
 class TokenGatedServer:
-    """A backend node that only accepts sessions carrying a valid MURX token."""
+    """A backend node that only accepts sessions carrying a valid MURX token.
+
+    ``verifier`` is usually a ``murx.tokens.SignedTokenVerifier``; a legacy
+    ``murx.server.TokenStore`` also works.
+    """
 
     def __init__(
         self,
-        token_store: TokenStore,
+        verifier: TokenVerifier,
         session_handler: SessionHandler,
         host: str = "0.0.0.0",
         port: int = 0,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ):
-        self.token_store = token_store
+        self.verifier = verifier
         self.session_handler = session_handler
         self.host = host
         self.port = port
+        self.ssl_context = ssl_context
         self._server: Optional[asyncio.base_events.Server] = None
 
     @property
@@ -42,7 +52,9 @@ class TokenGatedServer:
         return self._server.sockets[0].getsockname()[:2]
 
     async def start(self) -> None:
-        self._server = await asyncio.start_server(self._handle, self.host, self.port)
+        self._server = await asyncio.start_server(
+            self._handle, self.host, self.port, ssl=self.ssl_context
+        )
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -59,11 +71,11 @@ class TokenGatedServer:
         try:
             token_len = (await reader.readexactly(1))[0]
             token = await reader.readexactly(token_len)
-        except asyncio.IncompleteReadError:
+        except (asyncio.IncompleteReadError, ConnectionError, OSError, ssl.SSLError):
             writer.close()
             return
 
-        client_id = self.token_store.redeem(token)
+        client_id = self.verifier.redeem(token)
         if client_id is None:
             writer.close()
             return
